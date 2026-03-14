@@ -455,7 +455,7 @@ echo "python=$(which python 2>/dev/null || echo 'not found')"
                 # This avoids embedding large strings in the script body (which breaks base64 -d)
                 $writeOffboardScript = @'
 #!/bin/bash
-printf '%s' "$1" > /tmp/mde_offboard_b64.txt
+printf '%s' "$PAYLOAD" > /tmp/mde_offboard_b64.txt
 echo "write_exit=$?"
 '@
                 $null = Invoke-AzVMRunCommand `
@@ -463,7 +463,7 @@ echo "write_exit=$?"
                     -VMName            $vmName `
                     -CommandId         'RunShellScript' `
                     -ScriptString      $writeOffboardScript `
-                    -Parameter         @([PSCustomObject]@{ name = '1'; value = (Get-OffboardPayload) })
+                    -Parameter         @([pscustomobject]@{ name = 'PAYLOAD'; value = (Get-OffboardPayload) })
 
                 # Step 2: Decode and run the offboarding script
                 $offboardShell = @'
@@ -523,7 +523,7 @@ echo "Offboarding complete."
             # Step 1: Write the onboard Base64 payload to the VM
             $writeOnboardScript = @'
 #!/bin/bash
-printf '%s' "$1" > /tmp/mde_onboard_b64.txt
+printf '%s' "$PAYLOAD" > /tmp/mde_onboard_b64.txt
 echo "write_exit=$?"
 '@
             $null = Invoke-AzVMRunCommand `
@@ -531,7 +531,7 @@ echo "write_exit=$?"
                 -VMName            $vmName `
                 -CommandId         'RunShellScript' `
                 -ScriptString      $writeOnboardScript `
-                -Parameter         @([PSCustomObject]@{ name = '1'; value = (Get-OnboardPayload) })
+                -Parameter         @([pscustomobject]@{ name = 'PAYLOAD'; value = (Get-OnboardPayload) })
 
             # Step 2: Decode and run the onboarding script
             $onboardShell = @'
