@@ -1,0 +1,439 @@
+<#
+.SYNOPSIS
+    Offboard Linux VMs from old MDE tenant and onboard to GCC High MDE tenant.
+
+.DESCRIPTION
+    For each specified Linux VM:
+    1. Check current MDE/SENSE status and org ID
+    2. Run the offboarding Python script to offboard from old tenant
+    3. Remove the MDE.Linux VM extension
+    4. Wait for offboarding to complete
+    5. Run the onboarding Python script to onboard to GCC High tenant
+    6. Verify new org ID and service health
+    7. Reboot the VM
+
+.PARAMETER VMList
+    Optional array of hashtables with keys: VMName, ResourceGroupName, SubscriptionId.
+    If omitted, the runbook will search ALL subscriptions for Linux VMs to onboard.
+    Example: @(@{VMName='vm1';ResourceGroupName='rg1';SubscriptionId='sub-guid'})
+
+.PARAMETER SubscriptionFilter
+    Optional array of subscription IDs to limit discovery to. If omitted, all accessible
+    subscriptions are searched.
+
+.PARAMETER TagFilter
+    Optional hashtable of tag key/value pairs to filter VMs during discovery.
+    Example: @{Environment='Production'}
+
+.PARAMETER ExcludeVMs
+    Optional array of VM names to skip during discovery.
+
+.PARAMETER OffboardingScriptBase64
+    Base64-encoded content of the offboarding Python script.
+
+.PARAMETER OnboardingScriptBase64
+    Base64-encoded content of the onboarding Python script.
+
+.PARAMETER SkipReboot
+    If set, skip the VM reboot after onboarding.
+
+.PARAMETER OffboardWaitSeconds
+    Seconds to wait after offboarding before onboarding. Default: 30
+#>
+
+param(
+    [Parameter(Mandatory = $false)]
+    [hashtable[]]$VMList,
+
+    [Parameter(Mandatory = $false)]
+    [string[]]$SubscriptionFilter,
+
+    [Parameter(Mandatory = $false)]
+    [hashtable]$TagFilter,
+
+    [Parameter(Mandatory = $false)]
+    [string[]]$ExcludeVMs,
+
+    [Parameter(Mandatory = $true)]
+    [string]$OffboardingScriptBase64,
+
+    [Parameter(Mandatory = $true)]
+    [string]$OnboardingScriptBase64,
+
+    [switch]$SkipReboot,
+
+    [int]$OffboardWaitSeconds = 30
+)
+
+$ErrorActionPreference = 'Continue'
+$ProgressPreference = 'SilentlyContinue'
+
+# ===================================================================
+# AUTHENTICATE: Connect using Automation Account Managed Identity
+# ===================================================================
+Write-Host "Connecting to Azure using Managed Identity..."
+try {
+    Connect-AzAccount -Identity | Out-Null
+    Write-Host "Connected to Azure using Managed Identity."
+}
+catch {
+    Write-Error "Failed to authenticate with Managed Identity: $_"
+    throw
+}
+
+# ===================================================================
+# AUTO-DISCOVERY: Search all subscriptions for Linux VMs if no VMList
+# ===================================================================
+if (-not $VMList -or $VMList.Count -eq 0) {
+    Write-Host "No VMList supplied - discovering Linux VMs across subscriptions..."
+    Write-Host ("=" * 70)
+
+    # Get subscriptions to search
+    if ($SubscriptionFilter -and $SubscriptionFilter.Count -gt 0) {
+        $subscriptions = $SubscriptionFilter | ForEach-Object {
+            Get-AzSubscription -SubscriptionId $_ -ErrorAction SilentlyContinue
+        } | Where-Object { $_.State -eq 'Enabled' }
+        Write-Host "Searching $($subscriptions.Count) filtered subscription(s)..."
+    } else {
+        $subscriptions = Get-AzSubscription | Where-Object { $_.State -eq 'Enabled' }
+        Write-Host "Searching all $($subscriptions.Count) enabled subscription(s)..."
+    }
+
+    $discoveredVMs = @()
+
+    foreach ($sub in $subscriptions) {
+        Write-Host "`n--- Subscription: $($sub.Name) ($($sub.Id)) ---"
+        $null = Set-AzContext -SubscriptionId $sub.Id -ErrorAction Stop
+
+        # Query for Linux VMs (running)
+        $vms = Get-AzVM -Status -ErrorAction SilentlyContinue | Where-Object {
+            $_.StorageProfile.OSDisk.OSType -eq 'Linux' -and
+            ($_.PowerState -eq 'VM running')
+        }
+
+        if (-not $vms) {
+            Write-Host "  No running Linux VMs found."
+            continue
+        }
+
+        foreach ($v in $vms) {
+            # Apply tag filter if specified
+            if ($TagFilter -and $TagFilter.Count -gt 0) {
+                $matchesTags = $true
+                foreach ($key in $TagFilter.Keys) {
+                    if ($v.Tags[$key] -ne $TagFilter[$key]) {
+                        $matchesTags = $false
+                        break
+                    }
+                }
+                if (-not $matchesTags) {
+                    Write-Host "  Skipping $($v.Name) - does not match tag filter"
+                    continue
+                }
+            }
+
+            # Apply exclusion list
+            if ($ExcludeVMs -and $ExcludeVMs -contains $v.Name) {
+                Write-Host "  Skipping $($v.Name) - in exclusion list"
+                continue
+            }
+
+            Write-Host "  Found: $($v.Name) (RG: $($v.ResourceGroupName))"
+            $discoveredVMs += @{
+                VMName            = $v.Name
+                ResourceGroupName = $v.ResourceGroupName
+                SubscriptionId    = $sub.Id
+            }
+        }
+    }
+
+    if ($discoveredVMs.Count -eq 0) {
+        Write-Host "`nNo Linux VMs found to onboard. Exiting."
+        return
+    }
+
+    Write-Host "`n$('=' * 70)"
+    Write-Host "Discovered $($discoveredVMs.Count) Linux VM(s) to process."
+    Write-Host ("=" * 70)
+    $VMList = $discoveredVMs
+}
+
+function Write-Step {
+    param([string]$VM, [string]$Step, [string]$Message)
+    $ts = Get-Date -Format 'HH:mm:ss'
+    Write-Host "[$ts] [$VM] [$Step] $Message"
+}
+
+function Invoke-LinuxCommand {
+    param(
+        [string]$ResourceGroupName,
+        [string]$VMName,
+        [string]$Script
+    )
+    # Write script to temp file with Unix line endings
+    $tempFile = [IO.Path]::GetTempFileName() + '.sh'
+    $Script = $Script -replace "`r`n", "`n"
+    [IO.File]::WriteAllText($tempFile, $Script, [System.Text.UTF8Encoding]::new($false))
+    try {
+        $result = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName $VMName `
+            -CommandId 'RunShellScript' -ScriptPath $tempFile
+        return $result
+    } finally {
+        Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Save the original context to restore later
+$originalContext = Get-AzContext
+
+foreach ($vm in $VMList) {
+    $vmName = $vm.VMName
+    $rgName = $vm.ResourceGroupName
+    $subId  = $vm.SubscriptionId
+
+    # Switch subscription context if the VM has a SubscriptionId
+    if ($subId) {
+        $currentCtx = Get-AzContext
+        if ($currentCtx.Subscription.Id -ne $subId) {
+            Write-Host "`nSwitching to subscription: $subId"
+            $null = Set-AzContext -SubscriptionId $subId -ErrorAction Stop
+        }
+    }
+
+    Write-Host ""
+    Write-Host ("=" * 70)
+    Write-Host "Processing VM: $vmName (RG: $rgName) [Sub: $($subId ?? 'current')]"
+    Write-Host ("=" * 70)
+
+    # ---------------------------------------------------------------
+    # PHASE 1: Pre-check - Current MDE status
+    # ---------------------------------------------------------------
+    Write-Step $vmName "PRE-CHECK" "Checking current MDE status..."
+
+    $checkScript = @'
+#!/bin/bash
+echo "=== MDE Pre-Check ==="
+if command -v mdatp &>/dev/null; then
+    echo "mdatp_installed=true"
+    ORG_ID=$(mdatp health --field org_id 2>/dev/null | tr -d '"')
+    echo "org_id=$ORG_ID"
+    HEALTHY=$(mdatp health --field healthy 2>/dev/null)
+    echo "healthy=$HEALTHY"
+    LICENSED=$(mdatp health --field licensed 2>/dev/null)
+    echo "licensed=$LICENSED"
+    ONBOARDED=$(mdatp health --field onboarded 2>/dev/null 2>/dev/null)
+    echo "onboarded=$ONBOARDED"
+    echo "service_status=$(systemctl is-active mdatp 2>/dev/null)"
+else
+    echo "mdatp_installed=false"
+fi
+echo "python3_path=$(which python3 2>/dev/null)"
+echo "python_path=$(which python 2>/dev/null)"
+'@
+
+    $preCheck = Invoke-LinuxCommand -ResourceGroupName $rgName -VMName $vmName -Script $checkScript
+    $preOutput = $preCheck.Value[0].Message
+    Write-Step $vmName "PRE-CHECK" $preOutput
+
+    # ---------------------------------------------------------------
+    # PHASE 2: Offboarding
+    # ---------------------------------------------------------------
+    Write-Step $vmName "OFFBOARD" "Running offboarding script..."
+
+    $offboardShell = @"
+#!/bin/bash
+echo "=== Offboarding ==="
+
+# Decode and save offboarding script
+OFFBOARD_B64='$OffboardingScriptBase64'
+echo "`$OFFBOARD_B64" | base64 -d > /tmp/mde_offboard.py
+chmod +x /tmp/mde_offboard.py
+
+# Run offboarding script
+echo "Running offboarding Python script..."
+python3 /tmp/mde_offboard.py 2>&1 || python /tmp/mde_offboard.py 2>&1
+OFFBOARD_EXIT=`$?
+echo "Offboarding exit code: `$OFFBOARD_EXIT"
+
+# Check status after offboarding
+sleep 5
+if command -v mdatp &>/dev/null; then
+    ORG_ID=`$(mdatp health --field org_id 2>/dev/null | tr -d '"')
+    echo "post_offboard_org_id=`$ORG_ID"
+    echo "post_offboard_service=`$(systemctl is-active mdatp 2>/dev/null)"
+fi
+
+# Cleanup
+rm -f /tmp/mde_offboard.py
+echo "Offboarding script completed"
+"@
+
+    $offboardResult = Invoke-LinuxCommand -ResourceGroupName $rgName -VMName $vmName -Script $offboardShell
+    $offboardOutput = $offboardResult.Value[0].Message
+    Write-Step $vmName "OFFBOARD" $offboardOutput
+
+    if ($offboardResult.Value[1].Message) {
+        Write-Step $vmName "OFFBOARD" "STDERR: $($offboardResult.Value[1].Message)"
+    }
+
+    # ---------------------------------------------------------------
+    # PHASE 3: Remove MDE.Linux extension
+    # ---------------------------------------------------------------
+    Write-Step $vmName "EXTENSION" "Checking for MDE.Linux extension..."
+
+    $ext = Get-AzVMExtension -ResourceGroupName $rgName -VMName $vmName -Name 'MDE.Linux' -ErrorAction SilentlyContinue
+    if ($ext) {
+        Write-Step $vmName "EXTENSION" "Removing MDE.Linux extension..."
+        Remove-AzVMExtension -ResourceGroupName $rgName -VMName $vmName -Name 'MDE.Linux' -Force
+        Write-Step $vmName "EXTENSION" "MDE.Linux extension removed"
+    } else {
+        Write-Step $vmName "EXTENSION" "MDE.Linux extension not found (already removed)"
+    }
+
+    # ---------------------------------------------------------------
+    # PHASE 4: Wait for offboarding to settle
+    # ---------------------------------------------------------------
+    Write-Step $vmName "WAIT" "Waiting $OffboardWaitSeconds seconds for offboarding to settle..."
+    Start-Sleep -Seconds $OffboardWaitSeconds
+
+    # Check if mdatp is still running and stop it if needed
+    $stopScript = @'
+#!/bin/bash
+echo "=== Post-Offboard Check ==="
+if command -v mdatp &>/dev/null; then
+    echo "mdatp service: $(systemctl is-active mdatp 2>/dev/null)"
+    ORG_ID=$(mdatp health --field org_id 2>/dev/null | tr -d '"')
+    echo "org_id=$ORG_ID"
+    
+    # Remove the old onboard json to ensure clean state
+    if [ -f /etc/opt/microsoft/mdatp/mdatp_onboard.json ]; then
+        echo "Removing old onboard json..."
+        rm -f /etc/opt/microsoft/mdatp/mdatp_onboard.json
+        echo "Old onboard json removed"
+    fi
+fi
+'@
+
+    $postOffboard = Invoke-LinuxCommand -ResourceGroupName $rgName -VMName $vmName -Script $stopScript
+    Write-Step $vmName "WAIT" $postOffboard.Value[0].Message
+
+    # ---------------------------------------------------------------
+    # PHASE 5: Onboarding to GCC High
+    # ---------------------------------------------------------------
+    Write-Step $vmName "ONBOARD" "Running onboarding script..."
+
+    $onboardShell = @"
+#!/bin/bash
+echo "=== Onboarding to GCC High ==="
+
+# Decode and save onboarding script
+ONBOARD_B64='$OnboardingScriptBase64'
+echo "`$ONBOARD_B64" | base64 -d > /tmp/mde_onboard.py
+chmod +x /tmp/mde_onboard.py
+
+# Run onboarding script
+echo "Running onboarding Python script..."
+python3 /tmp/mde_onboard.py 2>&1 || python /tmp/mde_onboard.py 2>&1
+ONBOARD_EXIT=`$?
+echo "Onboarding exit code: `$ONBOARD_EXIT"
+
+# Verify the onboard json was written
+if [ -f /etc/opt/microsoft/mdatp/mdatp_onboard.json ]; then
+    echo "onboard_json_exists=true"
+    echo "onboard_json_content:"
+    cat /etc/opt/microsoft/mdatp/mdatp_onboard.json | python3 -c "import sys,json; d=json.load(sys.stdin); info=json.loads(d['onboardingInfo']); body=json.loads(info['body']); print('  orgId:', body['orgId']); print('  datacenter:', body['datacenter']); print('  geoLocationUrl:', body['geoLocationUrl'])" 2>/dev/null
+else
+    echo "onboard_json_exists=false"
+    echo "ERROR: Onboard json was not created!"
+fi
+
+# Restart mdatp service to pick up new config
+echo "Restarting mdatp service..."
+systemctl restart mdatp 2>/dev/null
+sleep 10
+
+# Check new status
+if command -v mdatp &>/dev/null; then
+    echo "=== Post-Onboard Status ==="
+    NEW_ORG=`$(mdatp health --field org_id 2>/dev/null | tr -d '"')
+    echo "new_org_id=`$NEW_ORG"
+    echo "service_status=`$(systemctl is-active mdatp 2>/dev/null)"
+    echo "healthy=`$(mdatp health --field healthy 2>/dev/null)"
+    echo "licensed=`$(mdatp health --field licensed 2>/dev/null)"
+fi
+
+# Cleanup
+rm -f /tmp/mde_onboard.py
+echo "Onboarding script completed"
+"@
+
+    $onboardResult = Invoke-LinuxCommand -ResourceGroupName $rgName -VMName $vmName -Script $onboardShell
+    $onboardOutput = $onboardResult.Value[0].Message
+    Write-Step $vmName "ONBOARD" $onboardOutput
+
+    if ($onboardResult.Value[1].Message) {
+        Write-Step $vmName "ONBOARD" "STDERR: $($onboardResult.Value[1].Message)"
+    }
+
+    # ---------------------------------------------------------------
+    # PHASE 6: Reboot
+    # ---------------------------------------------------------------
+    if (-not $SkipReboot) {
+        Write-Step $vmName "REBOOT" "Rebooting VM..."
+        Restart-AzVM -ResourceGroupName $rgName -Name $vmName
+        Write-Step $vmName "REBOOT" "VM reboot initiated"
+
+        # Wait for VM to come back
+        Write-Step $vmName "REBOOT" "Waiting for VM to come back online..."
+        $maxWait = 300
+        $elapsed = 0
+        do {
+            Start-Sleep -Seconds 15
+            $elapsed += 15
+            $vmStatus = Get-AzVM -ResourceGroupName $rgName -Name $vmName -Status
+            $powerState = ($vmStatus.Statuses | Where-Object { $_.Code -like 'PowerState/*' }).DisplayStatus
+        } while ($powerState -ne 'VM running' -and $elapsed -lt $maxWait)
+
+        if ($powerState -eq 'VM running') {
+            Write-Step $vmName "REBOOT" "VM is running. Waiting 30s for services to start..."
+            Start-Sleep -Seconds 30
+
+            # Final verification
+            $finalCheck = @'
+#!/bin/bash
+echo "=== Final Post-Reboot Verification ==="
+if command -v mdatp &>/dev/null; then
+    echo "mdatp_installed=true"
+    echo "service_status=$(systemctl is-active mdatp 2>/dev/null)"
+    ORG_ID=$(mdatp health --field org_id 2>/dev/null | tr -d '"')
+    echo "org_id=$ORG_ID"
+    echo "healthy=$(mdatp health --field healthy 2>/dev/null)"
+    echo "licensed=$(mdatp health --field licensed 2>/dev/null)"
+    echo "real_time_protection=$(mdatp health --field real_time_protection_enabled 2>/dev/null)"
+else
+    echo "mdatp_installed=false"
+    echo "WARNING: mdatp not found after reboot"
+fi
+'@
+            $finalResult = Invoke-LinuxCommand -ResourceGroupName $rgName -VMName $vmName -Script $finalCheck
+            Write-Step $vmName "VERIFY" $finalResult.Value[0].Message
+        } else {
+            Write-Step $vmName "REBOOT" "WARNING: VM did not come back within $maxWait seconds"
+        }
+    } else {
+        Write-Step $vmName "SKIP" "Reboot skipped (use -SkipReboot:`$false to enable)"
+    }
+
+    Write-Host ""
+    Write-Step $vmName "DONE" "Processing complete for $vmName"
+    Write-Host ("=" * 70)
+}
+
+# Restore original Azure context
+if ($originalContext) {
+    Write-Host "`nRestoring original Azure context..."
+    $null = Set-AzContext -SubscriptionId $originalContext.Subscription.Id -ErrorAction SilentlyContinue
+}
+
+Write-Host ""
+Write-Host "All VMs processed."
