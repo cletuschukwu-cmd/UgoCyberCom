@@ -29,6 +29,7 @@ $AutomationAccountName    = 'knightsautomation'
 $RunbookName              = 'Offboard-Onboard-MDE-Linux'
 $OffboardVarName          = 'MDE-Linux-Offboard-B64'
 $OnboardVarName           = 'MDE-Linux-Onboard-B64'
+$TenantDomain             = 'daveanddaveus.onmicrosoft.com'  # Target tenant
 
 $RunbookPath     = Join-Path $PSScriptRoot 'Offboard-Onboard-MDE-Linux.ps1'
 $OffboardB64Path = Join-Path $PSScriptRoot 'linux_offboard_base64.txt'
@@ -48,12 +49,21 @@ function Write-Doing { param([string]$Text) Write-Host "  [...] $Text"  -Foregro
 Write-Banner "STEP 1 of 7 — Authenticate to Azure"
 Write-Doing "Checking existing Azure context..."
 $ctx = Get-AzContext -ErrorAction SilentlyContinue
-if (-not $ctx) {
-    Write-Doing "No existing session. Launching interactive login..."
-    Connect-AzAccount -ErrorAction Stop | Out-Null
+$correctContext = $ctx -and $ctx.Subscription.Id -eq $AutomationSubscriptionId -and $ctx.Tenant.Domain -eq $TenantDomain
+
+if (-not $correctContext) {
+    Write-Doing "Connecting to tenant '$TenantDomain'..."
+    Connect-AzAccount -TenantId $TenantDomain -SubscriptionId $AutomationSubscriptionId -ErrorAction Stop | Out-Null
 }
-Set-AzContext -SubscriptionId $AutomationSubscriptionId -ErrorAction Stop | Out-Null
-Write-OK "Authenticated. Context set to Automation subscription: $AutomationSubscriptionId"
+
+try {
+    Set-AzContext -SubscriptionId $AutomationSubscriptionId -TenantId $TenantDomain -ErrorAction Stop | Out-Null
+} catch {
+    Write-Doing "Context switch failed — re-authenticating to '$TenantDomain'..."
+    Connect-AzAccount -TenantId $TenantDomain -SubscriptionId $AutomationSubscriptionId -ErrorAction Stop | Out-Null
+    Set-AzContext -SubscriptionId $AutomationSubscriptionId -ErrorAction Stop | Out-Null
+}
+Write-OK "Authenticated. Tenant: $TenantDomain | Subscription: $AutomationSubscriptionId"
 
 # ── STEP 2: Validate local files ─────────────────────────────────────────────
 Write-Banner "STEP 2 of 7 — Validate Local Files"
@@ -148,6 +158,14 @@ foreach ($sub in $subscriptions) {
     $scope = "/subscriptions/$($sub.Id)"
     Write-Doing "Processing: $($sub.Name) ($($sub.Id))"
 
+    # Switch context to this subscription so role queries run against the right scope
+    try {
+        Set-AzContext -SubscriptionId $sub.Id -TenantId $TenantDomain -ErrorAction Stop | Out-Null
+    } catch {
+        Write-Warn "  [AUTH-FAIL] Cannot access '$($sub.Name)' ($($sub.Id)): $($_.Exception.Message) — skipping RBAC assignment"
+        continue
+    }
+
     # Virtual Machine Contributor — required for RunCommand, extension removal, restart
     $hasVMC = Get-AzRoleAssignment `
         -ObjectId           $miPrincipalId `
@@ -190,7 +208,7 @@ foreach ($sub in $subscriptions) {
 }
 
 # Restore context to Automation Account subscription
-Set-AzContext -SubscriptionId $AutomationSubscriptionId | Out-Null
+Set-AzContext -SubscriptionId $AutomationSubscriptionId -TenantId $TenantDomain | Out-Null
 
 # ── STEP 6: DryRun ───────────────────────────────────────────────────────────
 Write-Banner "STEP 6 of 7 — DryRun (Discovery Only — No Changes)"

@@ -249,7 +249,12 @@ $discoveredVMs = @()
 
 foreach ($sub in $subscriptions) {
     Write-Output "`n--- Subscription: $($sub.Name) ($($sub.Id)) ---"
-    $null = Set-AzContext -SubscriptionId $sub.Id -ErrorAction Stop
+    try {
+        $null = Set-AzContext -SubscriptionId $sub.Id -ErrorAction Stop
+    } catch {
+        Write-Output "  [AUTH-FAIL] Cannot switch to subscription '$($sub.Name)' ($($sub.Id)): $($_.Exception.Message). Skipping — check Managed Identity RBAC."
+        continue
+    }
 
     $vms = Get-AzVM -Status -ErrorAction SilentlyContinue | Where-Object {
         $_.StorageProfile.OSDisk.OSType -eq 'Linux' -and
@@ -319,7 +324,16 @@ foreach ($vm in $discoveredVMs) {
     $currentCtx = Get-AzContext
     if ($currentCtx.Subscription.Id -ne $subId) {
         Write-Output "`nSwitching to subscription: $subName ($subId)"
-        $null = Set-AzContext -SubscriptionId $subId -ErrorAction Stop
+        try {
+            $null = Set-AzContext -SubscriptionId $subId -ErrorAction Stop
+        } catch {
+            $authMsg = "[AUTH-FAIL] Cannot switch to subscription '$subName' ($subId): $($_.Exception.Message). Skipping VM: $vmName"
+            Write-Output $authMsg
+            $vmResult.Status  = 'Failed'
+            $vmResult.Message = $authMsg
+            $results += $vmResult
+            continue
+        }
     }
 
     Write-Output "`n$('=' * 70)"
