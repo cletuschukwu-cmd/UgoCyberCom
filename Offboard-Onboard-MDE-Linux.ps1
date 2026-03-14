@@ -463,7 +463,7 @@ echo "write_exit=$?"
                     -VMName            $vmName `
                     -CommandId         'RunShellScript' `
                     -ScriptString      $writeOffboardScript `
-                    -Parameter         @([pscustomobject]@{ name = 'PAYLOAD'; value = (Get-OffboardPayload) })
+                    -Parameter         @{ PAYLOAD = (Get-OffboardPayload) }
 
                 # Step 2: Decode and run the offboarding script
                 $offboardShell = @'
@@ -531,7 +531,7 @@ echo "write_exit=$?"
                 -VMName            $vmName `
                 -CommandId         'RunShellScript' `
                 -ScriptString      $writeOnboardScript `
-                -Parameter         @([pscustomobject]@{ name = 'PAYLOAD'; value = (Get-OnboardPayload) })
+                -Parameter         @{ PAYLOAD = (Get-OnboardPayload) }
 
             # Step 2: Decode and run the onboarding script
             $onboardShell = @'
