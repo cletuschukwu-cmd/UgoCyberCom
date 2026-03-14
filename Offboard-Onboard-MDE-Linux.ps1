@@ -191,22 +191,27 @@ $script:_OnboardB64  = $null
 
 function Get-OffboardPayload {
     if ($null -eq $script:_OffboardB64) {
-        $script:_OffboardB64 = Get-Base64Payload `
+        $raw = Get-Base64Payload `
             -InlineValue   $OffboardingScriptBase64 `
             -VariableName  $OffboardingVariableName `
             -Label         'Offboarding' `
             -ParameterName 'OffboardingScriptBase64'
+        # Strip all whitespace/CRLF so the payload is a clean single-line Base64 string
+        # safe for direct embedding into a bash heredoc without breaking base64 -d
+        $script:_OffboardB64 = ($raw -replace '[\r\n\s]', '')
     }
     return $script:_OffboardB64
 }
 
 function Get-OnboardPayload {
     if ($null -eq $script:_OnboardB64) {
-        $script:_OnboardB64 = Get-Base64Payload `
+        $raw = Get-Base64Payload `
             -InlineValue   $OnboardingScriptBase64 `
             -VariableName  $OnboardingVariableName `
             -Label         'Onboarding' `
             -ParameterName 'OnboardingScriptBase64'
+        # Strip all whitespace/CRLF so the payload is a clean single-line Base64 string
+        $script:_OnboardB64 = ($raw -replace '[\r\n\s]', '')
     }
     return $script:_OnboardB64
 }

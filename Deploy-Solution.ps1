@@ -96,8 +96,9 @@ Write-OK "Runbook published: $RunbookName"
 
 # ── STEP 4: Store Base64 payloads as Automation Variables ────────────────────
 Write-Banner "STEP 4 of 7 — Store Payloads as Automation Variables"
-$offboardB64 = (Get-Content $OffboardB64Path -Raw).Trim()
-$onboardB64  = (Get-Content $OnboardB64Path  -Raw).Trim()
+# Strip all whitespace/CRLF — the variable must contain clean single-line Base64
+$offboardB64 = (Get-Content $OffboardB64Path -Raw) -replace '[\r\n\s]', ''
+$onboardB64  = (Get-Content $OnboardB64Path  -Raw) -replace '[\r\n\s]', ''
 
 foreach ($var in @(
     @{ Name = $OffboardVarName; Value = $offboardB64; Label = 'Offboard' }
