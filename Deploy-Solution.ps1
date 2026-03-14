@@ -113,22 +113,20 @@ foreach ($var in @(
         -ErrorAction           SilentlyContinue
 
     if ($existing) {
-        Set-AzAutomationVariable `
+        # Delete and recreate — Azure does not allow changing the encryption flag on an existing variable
+        Write-Doing "  Removing existing '$($var.Name)' (encryption flag may differ)..."
+        Remove-AzAutomationVariable `
             -ResourceGroupName     $AutomationResourceGroup `
             -AutomationAccountName $AutomationAccountName `
-            -Name                  $var.Name `
-            -Value                 $var.Value `
-            -Encrypted             $false | Out-Null
-        Write-OK "Updated: $($var.Name)"
-    } else {
-        New-AzAutomationVariable `
-            -ResourceGroupName     $AutomationResourceGroup `
-            -AutomationAccountName $AutomationAccountName `
-            -Name                  $var.Name `
-            -Value                 $var.Value `
-            -Encrypted             $false | Out-Null
-        Write-OK "Created: $($var.Name)"
+            -Name                  $var.Name | Out-Null
     }
+    New-AzAutomationVariable `
+        -ResourceGroupName     $AutomationResourceGroup `
+        -AutomationAccountName $AutomationAccountName `
+        -Name                  $var.Name `
+        -Value                 $var.Value `
+        -Encrypted             $false | Out-Null
+    Write-OK "$(if ($existing) { 'Replaced' } else { 'Created' }): $($var.Name)"
 }
 
 # ── STEP 5: Assign RBAC to Managed Identity across all subscriptions ──────────
