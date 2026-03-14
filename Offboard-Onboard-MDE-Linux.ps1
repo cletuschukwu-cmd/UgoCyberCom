@@ -389,10 +389,16 @@ if command -v mdatp &>/dev/null; then
     echo "org_id=$ORG_ID"
     echo "healthy=$(mdatp health --field healthy 2>/dev/null)"
     echo "licensed=$(mdatp health --field licensed 2>/dev/null)"
-    echo "onboarded=$(mdatp health --field onboarded 2>/dev/null)"
+    ONBOARDED=$(mdatp health --field onboarded 2>/dev/null | tr -d '"')
+    if echo "$ONBOARDED" | grep -qi 'true'; then
+        echo "onboarded=true"
+    else
+        echo "onboarded=false"
+    fi
 else
     echo "mdatp_installed=false"
     echo "mdatp_service=not-installed"
+    echo "onboarded=false"
 fi
 
 # Check python availability
@@ -410,6 +416,7 @@ echo "python=$(which python 2>/dev/null || echo 'not found')"
 
         # Parse mdatp status
         $mdatpRunning             = $detectOutput -match 'mdatp_service=active'
+        $mdatpOnboarded           = $detectOutput -match 'onboarded=true'
         $vmResult.MdatpWasRunning = $mdatpRunning
 
         # -----------------------------------------------------------
@@ -436,21 +443,34 @@ echo "python=$(which python 2>/dev/null || echo 'not found')"
         # -----------------------------------------------------------
         # PHASE 3: Offboard (only if mdatp service is actively running)
         # -----------------------------------------------------------
-        if ($mdatpRunning) {
-            Write-Step $vmName "OFFBOARD" "mdatp service is running. Running offboarding script..."
+        if ($mdatpRunning -and $mdatpOnboarded) {
+            Write-Step $vmName "OFFBOARD" "mdatp service is running and onboarded. Running offboarding script..."
 
             if ($DryRun) {
                 Write-Step $vmName "OFFBOARD" "[DryRun] Skipping offboard execution."
                 $vmResult.OffboardStatus = 'DryRun'
             }
             else {
-                # Base64 payload is embedded directly in the script to avoid RunCommand
-                # parameter size limits and named-variable passing ambiguity.
-                $offboardShell = (@'
+                # Step 1: Write the Base64 payload to the VM using RunCommand -Parameter
+                # This avoids embedding large strings in the script body (which breaks base64 -d)
+                $writeOffboardScript = @'
+#!/bin/bash
+printf '%s' "$1" > /tmp/mde_offboard_b64.txt
+echo "write_exit=$?"
+'@
+                $null = Invoke-AzVMRunCommand `
+                    -ResourceGroupName $rgName `
+                    -VMName            $vmName `
+                    -CommandId         'RunShellScript' `
+                    -ScriptString      $writeOffboardScript `
+                    -Parameter         @([PSCustomObject]@{ name = '1'; value = (Get-OffboardPayload) })
+
+                # Step 2: Decode and run the offboarding script
+                $offboardShell = @'
 #!/bin/bash
 echo "=== Offboarding from current MDE tenant ==="
-OFFBOARD_B64='<<OFFBOARD_B64>>'
-printf '%s' "$OFFBOARD_B64" | base64 -d > /tmp/mde_offboard.py
+if [ ! -f /tmp/mde_offboard_b64.txt ]; then echo "ERROR: payload file not found"; exit 1; fi
+base64 -d /tmp/mde_offboard_b64.txt > /tmp/mde_offboard.py
 if [ $? -ne 0 ]; then echo "ERROR: base64 decode failed"; exit 1; fi
 chmod +x /tmp/mde_offboard.py
 python3 /tmp/mde_offboard.py 2>&1
@@ -462,9 +482,9 @@ if command -v mdatp &>/dev/null; then
     echo "post_offboard_service=$(systemctl is-active mdatp 2>/dev/null)"
 fi
 rm -f /etc/opt/microsoft/mdatp/mdatp_onboard.json
-rm -f /tmp/mde_offboard.py
+rm -f /tmp/mde_offboard.py /tmp/mde_offboard_b64.txt
 echo "Offboarding complete."
-'@) -replace '<<OFFBOARD_B64>>', (Get-OffboardPayload)
+'@
 
                 $offResult = Invoke-LinuxCommand -ResourceGroupName $rgName -VMName $vmName -Script $offboardShell
                 $offOutput = $offResult.Value[0].Message
@@ -482,7 +502,11 @@ echo "Offboarding complete."
             }
         }
         else {
-            Write-Step $vmName "OFFBOARD" "mdatp service is not running. Skipping offboarding."
+            if (-not $mdatpRunning) {
+                Write-Step $vmName "OFFBOARD" "mdatp service is not running. Skipping offboarding."
+            } else {
+                Write-Step $vmName "OFFBOARD" "mdatp is installed but NOT onboarded to any tenant (unlicensed/orphaned). Skipping offboarding."
+            }
             $vmResult.OffboardStatus = 'NotNeeded'
         }
 
@@ -496,11 +520,25 @@ echo "Offboarding complete."
             $vmResult.OnboardStatus = 'DryRun'
         }
         else {
-            $onboardShell = (@'
+            # Step 1: Write the onboard Base64 payload to the VM
+            $writeOnboardScript = @'
+#!/bin/bash
+printf '%s' "$1" > /tmp/mde_onboard_b64.txt
+echo "write_exit=$?"
+'@
+            $null = Invoke-AzVMRunCommand `
+                -ResourceGroupName $rgName `
+                -VMName            $vmName `
+                -CommandId         'RunShellScript' `
+                -ScriptString      $writeOnboardScript `
+                -Parameter         @([PSCustomObject]@{ name = '1'; value = (Get-OnboardPayload) })
+
+            # Step 2: Decode and run the onboarding script
+            $onboardShell = @'
 #!/bin/bash
 echo "=== Onboarding to target MDE tenant ==="
-ONBOARD_B64='<<ONBOARD_B64>>'
-printf '%s' "$ONBOARD_B64" | base64 -d > /tmp/mde_onboard.py
+if [ ! -f /tmp/mde_onboard_b64.txt ]; then echo "ERROR: payload file not found"; exit 1; fi
+base64 -d /tmp/mde_onboard_b64.txt > /tmp/mde_onboard.py
 if [ $? -ne 0 ]; then echo "ERROR: base64 decode failed"; exit 1; fi
 chmod +x /tmp/mde_onboard.py
 python3 /tmp/mde_onboard.py 2>&1
@@ -522,9 +560,9 @@ if command -v mdatp &>/dev/null; then
     echo "healthy=$(mdatp health --field healthy 2>/dev/null)"
     echo "licensed=$(mdatp health --field licensed 2>/dev/null)"
 fi
-rm -f /tmp/mde_onboard.py
+rm -f /tmp/mde_onboard.py /tmp/mde_onboard_b64.txt
 echo "Onboarding complete."
-'@) -replace '<<ONBOARD_B64>>', (Get-OnboardPayload)
+'@
 
             $onResult = Invoke-LinuxCommand -ResourceGroupName $rgName -VMName $vmName -Script $onboardShell
             $onOutput = $onResult.Value[0].Message
