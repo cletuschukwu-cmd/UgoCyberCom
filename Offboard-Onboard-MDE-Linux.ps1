@@ -451,35 +451,22 @@ echo "python=$(which python 2>/dev/null || echo 'not found')"
                 $vmResult.OffboardStatus = 'DryRun'
             }
             else {
-                # Write the Base64 payload to the VM via Invoke-LinuxCommand (ScriptPath/temp-file approach).
-                # PowerShell builds the script string with the payload embedded before writing to the temp file,
-                # so the Base64 value never goes through bash variable substitution or shell quoting.
-                $offB64 = Get-OffboardPayload
-                $writeOffboardScript = "#!/bin/bash`nprintf '%s' '$offB64' > /tmp/mde_offboard_b64.txt`necho write_exit=`$?`n"
-                $null = Invoke-LinuxCommand -ResourceGroupName $rgName -VMName $vmName -Script $writeOffboardScript
+                # Decode on the Automation worker (PowerShell) and write the Python script
+                # directly to a temp file, then deliver it via ScriptPath — no base64 on VM.
+                $offPyBytes  = [Convert]::FromBase64String((Get-OffboardPayload))
+                $offPyFile   = [IO.Path]::GetTempFileName() + '.py'
+                $offShFile   = [IO.Path]::GetTempFileName() + '.sh'
+                [IO.File]::WriteAllBytes($offPyFile, $offPyBytes)
 
-                # Decode and run the offboarding script
-                $offboardShell = @'
-#!/bin/bash
-echo "=== Offboarding from current MDE tenant ==="
-if [ ! -f /tmp/mde_offboard_b64.txt ]; then echo "ERROR: payload file not found"; exit 1; fi
-base64 -d /tmp/mde_offboard_b64.txt > /tmp/mde_offboard.py
-if [ $? -ne 0 ]; then echo "ERROR: base64 decode failed"; exit 1; fi
-chmod +x /tmp/mde_offboard.py
-python3 /tmp/mde_offboard.py 2>&1
-OFFBOARD_EXIT=$?
-echo "offboard_exit_code=$OFFBOARD_EXIT"
-sleep 5
-if command -v mdatp &>/dev/null; then
-    echo "post_offboard_org_id=$(mdatp health --field org_id 2>/dev/null | tr -d '"')"
-    echo "post_offboard_service=$(systemctl is-active mdatp 2>/dev/null)"
-fi
-rm -f /etc/opt/microsoft/mdatp/mdatp_onboard.json
-rm -f /tmp/mde_offboard.py /tmp/mde_offboard_b64.txt
-echo "Offboarding complete."
-'@
-
-                $offResult = Invoke-LinuxCommand -ResourceGroupName $rgName -VMName $vmName -Script $offboardShell
+                # Build a shell script that cats the Python file content via heredoc
+                $offPyContent = [IO.File]::ReadAllText($offPyFile)
+                Remove-Item $offPyFile -Force -ErrorAction SilentlyContinue
+                $offboardShell = "#!/bin/bash`necho '=== Offboarding from current MDE tenant ==='`ncat > /tmp/mde_offboard.py << 'PYEOF'`n$offPyContent`nPYEOF`nchmod +x /tmp/mde_offboard.py`npython3 /tmp/mde_offboard.py 2>&1`nOFFBOARD_EXIT=`$?`necho offboard_exit_code=`$OFFBOARD_EXIT`nsleep 5`nif command -v mdatp &>/dev/null; then`n    echo post_offboard_service=`$(systemctl is-active mdatp 2>/dev/null)`nfi`nrm -f /etc/opt/microsoft/mdatp/mdatp_onboard.json /tmp/mde_offboard.py`necho Offboarding complete."
+                $offboardShell = $offboardShell -replace "`r`n", "`n"
+                [IO.File]::WriteAllText($offShFile, $offboardShell, [System.Text.UTF8Encoding]::new($false))
+                $offResult = try {
+                    Invoke-AzVMRunCommand -ResourceGroupName $rgName -VMName $vmName -CommandId 'RunShellScript' -ScriptPath $offShFile
+                } finally { Remove-Item $offShFile -Force -ErrorAction SilentlyContinue }
                 $offOutput = $offResult.Value[0].Message
                 Write-Step $vmName "OFFBOARD" $offOutput
 
@@ -513,43 +500,20 @@ echo "Offboarding complete."
             $vmResult.OnboardStatus = 'DryRun'
         }
         else {
-            # Write the Base64 payload to the VM via Invoke-LinuxCommand.
-            $onB64 = Get-OnboardPayload
-            $writeOnboardScript = "#!/bin/bash`nprintf '%s' '$onB64' > /tmp/mde_onboard_b64.txt`necho write_exit=`$?`n"
-            $null = Invoke-LinuxCommand -ResourceGroupName $rgName -VMName $vmName -Script $writeOnboardScript
+            # Decode on the Automation worker and write the Python script directly via ScriptPath.
+            $onPyBytes   = [Convert]::FromBase64String((Get-OnboardPayload))
+            $onPyFile    = [IO.Path]::GetTempFileName() + '.py'
+            $onShFile    = [IO.Path]::GetTempFileName() + '.sh'
+            [IO.File]::WriteAllBytes($onPyFile, $onPyBytes)
 
-            # Decode and run the onboarding script
-            $onboardShell = @'
-#!/bin/bash
-echo "=== Onboarding to target MDE tenant ==="
-if [ ! -f /tmp/mde_onboard_b64.txt ]; then echo "ERROR: payload file not found"; exit 1; fi
-base64 -d /tmp/mde_onboard_b64.txt > /tmp/mde_onboard.py
-if [ $? -ne 0 ]; then echo "ERROR: base64 decode failed"; exit 1; fi
-chmod +x /tmp/mde_onboard.py
-python3 /tmp/mde_onboard.py 2>&1
-ONBOARD_EXIT=$?
-echo "onboard_exit_code=$ONBOARD_EXIT"
-if [ -f /etc/opt/microsoft/mdatp/mdatp_onboard.json ]; then
-    echo "onboard_json=present"
-else
-    echo "onboard_json=missing"
-    echo "ERROR: Onboard json was not created!"
-fi
-systemctl restart mdatp 2>/dev/null
-sleep 10
-if command -v mdatp &>/dev/null; then
-    echo "=== Post-Onboard Verification ==="
-    NEW_ORG=$(mdatp health --field org_id 2>/dev/null | tr -d '"')
-    echo "new_org_id=$NEW_ORG"
-    echo "service_status=$(systemctl is-active mdatp 2>/dev/null)"
-    echo "healthy=$(mdatp health --field healthy 2>/dev/null)"
-    echo "licensed=$(mdatp health --field licensed 2>/dev/null)"
-fi
-rm -f /tmp/mde_onboard.py /tmp/mde_onboard_b64.txt
-echo "Onboarding complete."
-'@
-
-            $onResult = Invoke-LinuxCommand -ResourceGroupName $rgName -VMName $vmName -Script $onboardShell
+            $onPyContent = [IO.File]::ReadAllText($onPyFile)
+            Remove-Item $onPyFile -Force -ErrorAction SilentlyContinue
+            $onboardShell = "#!/bin/bash`necho '=== Onboarding to target MDE tenant ==='`ncat > /tmp/mde_onboard.py << 'PYEOF'`n$onPyContent`nPYEOF`nchmod +x /tmp/mde_onboard.py`npython3 /tmp/mde_onboard.py 2>&1`nONBOARD_EXIT=`$?`necho onboard_exit_code=`$ONBOARD_EXIT`nif [ -f /etc/opt/microsoft/mdatp/mdatp_onboard.json ]; then echo onboard_json=present; else echo onboard_json=missing; fi`nsystemctl restart mdatp 2>/dev/null`nsleep 10`nif command -v mdatp &>/dev/null; then`n    NEW_ORG=`$(mdatp health --field org_id 2>/dev/null | tr -d '"')`n    echo new_org_id=`$NEW_ORG`n    echo service_status=`$(systemctl is-active mdatp 2>/dev/null)`n    echo healthy=`$(mdatp health --field healthy 2>/dev/null)`n    echo licensed=`$(mdatp health --field licensed 2>/dev/null)`nfi`nrm -f /tmp/mde_onboard.py`necho Onboarding complete."
+            $onboardShell = $onboardShell -replace "`r`n", "`n"
+            [IO.File]::WriteAllText($onShFile, $onboardShell, [System.Text.UTF8Encoding]::new($false))
+            $onResult = try {
+                Invoke-AzVMRunCommand -ResourceGroupName $rgName -VMName $vmName -CommandId 'RunShellScript' -ScriptPath $onShFile
+            } finally { Remove-Item $onShFile -Force -ErrorAction SilentlyContinue }
             $onOutput = $onResult.Value[0].Message
             Write-Step $vmName "ONBOARD" $onOutput
 
