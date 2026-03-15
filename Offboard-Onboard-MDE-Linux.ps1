@@ -451,21 +451,14 @@ echo "python=$(which python 2>/dev/null || echo 'not found')"
                 $vmResult.OffboardStatus = 'DryRun'
             }
             else {
-                # Step 1: Write the Base64 payload to the VM using RunCommand -Parameter
-                # This avoids embedding large strings in the script body (which breaks base64 -d)
-                $writeOffboardScript = @'
-#!/bin/bash
-printf '%s' "$PAYLOAD" > /tmp/mde_offboard_b64.txt
-echo "write_exit=$?"
-'@
-                $null = Invoke-AzVMRunCommand `
-                    -ResourceGroupName $rgName `
-                    -VMName            $vmName `
-                    -CommandId         'RunShellScript' `
-                    -ScriptString      $writeOffboardScript `
-                    -Parameter         @{ PAYLOAD = (Get-OffboardPayload) }
+                # Write the Base64 payload to the VM via Invoke-LinuxCommand (ScriptPath/temp-file approach).
+                # PowerShell builds the script string with the payload embedded before writing to the temp file,
+                # so the Base64 value never goes through bash variable substitution or shell quoting.
+                $offB64 = Get-OffboardPayload
+                $writeOffboardScript = "#!/bin/bash`nprintf '%s' '$offB64' > /tmp/mde_offboard_b64.txt`necho write_exit=`$?`n"
+                $null = Invoke-LinuxCommand -ResourceGroupName $rgName -VMName $vmName -Script $writeOffboardScript
 
-                # Step 2: Decode and run the offboarding script
+                # Decode and run the offboarding script
                 $offboardShell = @'
 #!/bin/bash
 echo "=== Offboarding from current MDE tenant ==="
@@ -520,20 +513,12 @@ echo "Offboarding complete."
             $vmResult.OnboardStatus = 'DryRun'
         }
         else {
-            # Step 1: Write the onboard Base64 payload to the VM
-            $writeOnboardScript = @'
-#!/bin/bash
-printf '%s' "$PAYLOAD" > /tmp/mde_onboard_b64.txt
-echo "write_exit=$?"
-'@
-            $null = Invoke-AzVMRunCommand `
-                -ResourceGroupName $rgName `
-                -VMName            $vmName `
-                -CommandId         'RunShellScript' `
-                -ScriptString      $writeOnboardScript `
-                -Parameter         @{ PAYLOAD = (Get-OnboardPayload) }
+            # Write the Base64 payload to the VM via Invoke-LinuxCommand.
+            $onB64 = Get-OnboardPayload
+            $writeOnboardScript = "#!/bin/bash`nprintf '%s' '$onB64' > /tmp/mde_onboard_b64.txt`necho write_exit=`$?`n"
+            $null = Invoke-LinuxCommand -ResourceGroupName $rgName -VMName $vmName -Script $writeOnboardScript
 
-            # Step 2: Decode and run the onboarding script
+            # Decode and run the onboarding script
             $onboardShell = @'
 #!/bin/bash
 echo "=== Onboarding to target MDE tenant ==="
