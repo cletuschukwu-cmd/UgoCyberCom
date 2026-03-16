@@ -177,6 +177,10 @@ function Get-Base64Payload {
         if (-not $value) {
             throw "Automation variable '$VariableName' for $Label is empty."
         }
+        # Log raw value diagnostics to help diagnose encoding issues
+        $rawLen = $value.Length
+        $firstChars = $value.Substring(0, [Math]::Min(20, $rawLen))
+        Write-Output "${Label} variable raw length: $rawLen | first20: $firstChars"
         return $value
     }
 
@@ -196,9 +200,9 @@ function Get-OffboardPayload {
             -VariableName  $OffboardingVariableName `
             -Label         'Offboarding' `
             -ParameterName 'OffboardingScriptBase64'
-        # Strip all whitespace/CRLF so the payload is a clean single-line Base64 string
-        # safe for direct embedding into a bash heredoc without breaking base64 -d
-        $script:_OffboardB64 = ($raw -replace '[\r\n\s]', '')
+        # Keep ONLY valid Base64 characters — strips whitespace, quotes, escape sequences,
+        # and any other characters that Get-AutomationVariable / JSON serialization may add.
+        $script:_OffboardB64 = [regex]::Replace($raw, '[^A-Za-z0-9+/=]', '')
     }
     return $script:_OffboardB64
 }
@@ -210,8 +214,9 @@ function Get-OnboardPayload {
             -VariableName  $OnboardingVariableName `
             -Label         'Onboarding' `
             -ParameterName 'OnboardingScriptBase64'
-        # Strip all whitespace/CRLF so the payload is a clean single-line Base64 string
-        $script:_OnboardB64 = ($raw -replace '[\r\n\s]', '')
+        # Keep ONLY valid Base64 characters — strips whitespace, quotes, escape sequences,
+        # and any other characters that Get-AutomationVariable / JSON serialization may add.
+        $script:_OnboardB64 = [regex]::Replace($raw, '[^A-Za-z0-9+/=]', '')
     }
     return $script:_OnboardB64
 }
