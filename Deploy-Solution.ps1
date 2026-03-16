@@ -212,11 +212,18 @@ Set-AzContext -SubscriptionId $AutomationSubscriptionId -TenantId $TenantDomain 
 # ── STEP 6: DryRun ───────────────────────────────────────────────────────────
 Write-Banner "STEP 6 of 7 — DryRun (Discovery Only — No Changes)"
 Write-Doing "Starting DryRun job..."
+
+# Load clean single-line B64 payloads from local files to pass as job parameters.
+# This bypasses Get-AutomationVariable deserialization quirks inside the sandbox.
+$offB64 = (Get-Content $OffboardB64Path -Raw) -replace '[^A-Za-z0-9+/=]', ''
+$onB64  = (Get-Content $OnboardB64Path  -Raw) -replace '[^A-Za-z0-9+/=]', ''
+Write-Doing "  Offboard payload: $($offB64.Length) chars | Onboard payload: $($onB64.Length) chars"
+
 $dryRunJob = Start-AzAutomationRunbook `
     -ResourceGroupName     $AutomationResourceGroup `
     -AutomationAccountName $AutomationAccountName `
     -Name                  $RunbookName `
-    -Parameters            @{ DryRun = $true } `
+    -Parameters            @{ DryRun = $true; OffboardingScriptBase64 = $offB64; OnboardingScriptBase64 = $onB64 } `
     -ErrorAction           Stop
 
 Write-OK "DryRun Job ID: $($dryRunJob.JobId)"
@@ -254,6 +261,7 @@ $liveJob = Start-AzAutomationRunbook `
     -ResourceGroupName     $AutomationResourceGroup `
     -AutomationAccountName $AutomationAccountName `
     -Name                  $RunbookName `
+    -Parameters            @{ OffboardingScriptBase64 = $offB64; OnboardingScriptBase64 = $onB64 } `
     -ErrorAction           Stop
 
 Write-OK "Live Job ID: $($liveJob.JobId)"
