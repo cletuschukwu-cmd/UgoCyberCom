@@ -177,10 +177,13 @@ function Get-Base64Payload {
         if (-not $value) {
             throw "Automation variable '$VariableName' for $Label is empty."
         }
-        # Log raw value diagnostics to help diagnose encoding issues
-        $rawLen = $value.Length
-        $firstChars = $value.Substring(0, [Math]::Min(20, $rawLen))
-        Write-Output "${Label} variable raw length: $rawLen | first20: $firstChars"
+        # Diagnostics: raw length, type, first/last 20 chars, any non-base64 chars
+        $rawType  = $value.GetType().Name
+        $rawLen   = $value.Length
+        $first20  = $value.Substring(0, [Math]::Min(20, $rawLen))
+        $last20   = $value.Substring([Math]::Max(0, $rawLen - 20))
+        $badChars = ([regex]::Matches($value, '[^A-Za-z0-9+/=]') | ForEach-Object { [int][char]$_.Value }) -join ','
+        Write-Output "${Label}: type=$rawType len=$rawLen first20=$first20 last20=$last20 badCharCodes=[$badChars]"
         return $value
     }
 
@@ -200,9 +203,11 @@ function Get-OffboardPayload {
             -VariableName  $OffboardingVariableName `
             -Label         'Offboarding' `
             -ParameterName 'OffboardingScriptBase64'
-        # Keep ONLY valid Base64 characters — strips whitespace, quotes, escape sequences,
-        # and any other characters that Get-AutomationVariable / JSON serialization may add.
-        $script:_OffboardB64 = [regex]::Replace($raw, '[^A-Za-z0-9+/=]', '')
+        # Keep ONLY valid Base64 characters, then re-pad to multiple of 4
+        $stripped = [regex]::Replace($raw, '[^A-Za-z0-9+/]', '')
+        $pad = (4 - ($stripped.Length % 4)) % 4
+        $script:_OffboardB64 = $stripped + ('=' * $pad)
+        Write-Output "Offboarding B64 stripped length: $($stripped.Length) | padded length: $($script:_OffboardB64.Length)"
     }
     return $script:_OffboardB64
 }
@@ -214,9 +219,11 @@ function Get-OnboardPayload {
             -VariableName  $OnboardingVariableName `
             -Label         'Onboarding' `
             -ParameterName 'OnboardingScriptBase64'
-        # Keep ONLY valid Base64 characters — strips whitespace, quotes, escape sequences,
-        # and any other characters that Get-AutomationVariable / JSON serialization may add.
-        $script:_OnboardB64 = [regex]::Replace($raw, '[^A-Za-z0-9+/=]', '')
+        # Keep ONLY valid Base64 characters, then re-pad to multiple of 4
+        $stripped = [regex]::Replace($raw, '[^A-Za-z0-9+/]', '')
+        $pad = (4 - ($stripped.Length % 4)) % 4
+        $script:_OnboardB64 = $stripped + ('=' * $pad)
+        Write-Output "Onboarding B64 stripped length: $($stripped.Length) | padded length: $($script:_OnboardB64.Length)"
     }
     return $script:_OnboardB64
 }
